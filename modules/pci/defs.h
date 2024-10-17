@@ -1,0 +1,64 @@
+#ifndef DEFS_H
+#define DEFS_H
+
+/* FIXME: replace with proper enum entry when moving upstream */
+#define SNDRV_HWDEP_IFACE_HOLOPLOT	100
+
+/* Hardware limits */
+#define BUFFER_BYTES_MAX	SZ_1M
+#define PERIOD_BYTES_MIN	32
+#define PERIOD_BYTES_MAX	(BUFFER_BYTES_MAX / 2)
+#define BUFFER_ALIGNMENT	256
+#define PERIODS_MIN		2
+#define PERIODS_MAX		(BUFFER_BYTES_MAX / PERIOD_BYTES_MIN)
+#define CHANNELS_MIN		1
+#define CHANNELS_MAX		256
+
+#define REG_MISC_RESET			0x00	/* Write only */
+#define REG_MISC_DEVICE_ID		0x01	/* Read only */
+#define REG_MISC_DESIGN_TYPE_VERSION	0x02	/* Read only */
+#define REG_MISC_PRIMARY_IP		0x03	/* Read only */
+#define REG_MISC_SECONDARY_IP		0x04	/* Read only */
+#define REG_MISC_PRIMARY_MAC		0x05	/* Read only */
+#define REG_MISC_SECONDARY_MAC		0x06	/* Read only */
+#define REG_MISC_PCM_CONTROL_BASE	0x10
+#define REG_MISC_PLAYBACK_SRC_ADDR	0x11
+#define REG_MISC_PLAYBACK_SIZE		0x12
+#define REG_MISC_CAPTURE_DST_ADDR	0x13
+#define REG_MISC_CAPTURE_SIZE		0x14
+
+#define DMA_CHANNEL_CAPTURE		0
+#define DMA_CHANNEL_PLAYBACK		1
+#define DMA_CHANNEL_MISC_READ		2
+#define DMA_CHANNEL_MISC_WRITE		3
+
+#define MISC_INTERRUPT_INIT_DONE	0xabab0000
+#define MISC_INTERRUPT_REQUEST		0xabab0001
+#define MISC_INTERRUPT_REPLY		0xabab0002
+
+#define MISC_TRANSACTION_TIMEOUT	msecs_to_jiffies(1000)
+
+#define REG_DMA_BASE(CHANNEL)			((CHANNEL)*0x80)
+#define REG_DMA_SCRATCH_0			0x50
+#define REG_DMA_SCRATCH_1			0x54
+#define REG_DMA_SCRATCH_2			0x58
+#define REG_DMA_SCRATCH_3			0x5c
+#define REG_DMA_PCIE_INTERRUPT_STATUS		0x64
+#define REG_DMA_PCIE_SOFTWARE_INTERRUPT		BIT(3)
+#define REG_DMA_AXI_IRQ_CONTROL			0x68
+#define REG_DMA_AXI_INTERRUPT_ASSERT		0x74
+
+/* Registers mapped on BAR2 */
+#define REG_PCM_CAPTURE_OFFSET		0x0000
+#define REG_PCM_PLAYBACK_OFFSET		0x1000
+
+#define REG_PCM_CONTROL			0x00
+#define REG_PCM_CONTROL_RUN		BIT(0)
+#define REG_PCM_CONTROL_RESET		BIT(1)
+#define REG_PCM_SRC_DST_ADDR		0x08
+#define REG_PCM_BUFFER_SIZE		0x10
+#define REG_PCM_PERIOD_SIZE		0x18
+#define REG_PCM_POSITION		0x20
+#define REG_PCM_CHANNEL_COUNT		0x30
+
+#endif /* DEFS_H */
