@@ -26,11 +26,11 @@
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 module_param_array(index, int, NULL, 0444);
-MODULE_PARM_DESC(index, "Index value for the Holoplut holoplot_pci PCIe soundcard.");
+MODULE_PARM_DESC(index, "Index value for the Holoplut PCIe soundcard.");
 
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 module_param_array(id, charp, NULL, 0444);
-MODULE_PARM_DESC(id, "ID string for the Holoplut holoplot_pci PCIe soundcard.");
+MODULE_PARM_DESC(id, "ID string for the Holoplut PCIe soundcard.");
 
 #define BUFFER_BYTES_MAX	SZ_1M
 #define PERIOD_BYTES_MIN	32
@@ -38,25 +38,48 @@ MODULE_PARM_DESC(id, "ID string for the Holoplut holoplot_pci PCIe soundcard.");
 #define PERIODS_MIN		2
 #define PERIODS_MAX		(BUFFER_BYTES_MAX / PERIOD_BYTES_MIN)
 
+/* ... */
+#define REMOTE_EGRESS_SOURCE	0xe8000000
+
 /* Registers mapped on BAR0 */
+#define REG_AXIPCIE_MAIN_BASE		0x8000
+
+#define REG_AXIPCIE_INGRESS_BASE(X)	(0x8800 + (X)*0x20)
+#define REG_AXIPCIE_INGRESS_CONTROL	0x08
+#define REG_AXIPCIE_INGRESS_SRC_ADDR_LO	0x10
+#define REG_AXIPCIE_INGRESS_SRC_ADDR_HI	0x14
+#define REG_AXIPCIE_INGRESS_DST_ADDR_LO 0x18
+#define REG_AXIPCIE_INGRESS_DST_ADDR_HI 0x1c
+
+#define REG_AXIPCIE_EGRESS_BASE(X)	(0x8c00 + (X)*0x20)
+#define REG_AXIPCIE_EGRESS_CONTROL	0x08
+#define REG_AXIPCIE_EGRESS_SRC_ADDR_LO	0x10
+#define REG_AXIPCIE_EGRESS_SRC_ADDR_HI	0x14
+#define REG_AXIPCIE_EGRESS_DST_ADDR_LO	0x18
+#define REG_AXIPCIE_EGRESS_DST_ADDR_HI	0x1c
+
+#define REG_DMA_IRQ_0_STATUS		0x64
+#define REG_DMA_IRQ_1_STATUS		0xe4
 
 /* Registers mapped on BAR2 */
-#define REG_CC_PLAYBACK_CONTROL			0x00
-#define REG_CC_PLAYBACK_CONTROL_RUN		BIT(0)
-#define REG_CC_PLAYBACK_CONTROL_RESET		BIT(1)
-#define REG_CC_PLAYBACK_BUFFER_SIZE		0x08
-#define REG_CC_PLAYBACK_PERIOD_SIZE		0x10
-#define REG_CC_PLAYBACK_POSITION		0x18
-
-#define REG_CC_CAPTURE_CONTROL			0x20
+#define REG_CC_CAPTURE_CONTROL			0x00
 #define REG_CC_CAPTURE_CONTROL_RUN		BIT(0)
 #define REG_CC_CAPTURE_CONTROL_RESET		BIT(1)
-#define REG_CC_CAPTURE_BUFFER_SIZE		0x28
-#define REG_CC_CAPTURE_PERIOD_SIZE		0x30
-#define REG_CC_CAPTURE_POSITION			0x38
+#define REG_CC_CAPTURE_SRC_ADDR			0x08
+#define REG_CC_CAPTURE_BUFFER_SIZE		0x10
+#define REG_CC_CAPTURE_PERIOD_SIZE		0x18
+#define REG_CC_CAPTURE_POSITION			0x20
 
-#define REG_BAR2_DESIGN_TYPE_AND_VERSION	0x40
-#define REG_BAR2_DEVICE_ID			0x48
+#define REG_CC_PLAYBACK_CONTROL			0x30
+#define REG_CC_PLAYBACK_CONTROL_RUN		BIT(0)
+#define REG_CC_PLAYBACK_CONTROL_RESET		BIT(1)
+#define REG_CC_PLAYBACK_SRC_ADDR		0x38
+#define REG_CC_PLAYBACK_BUFFER_SIZE		0x40
+#define REG_CC_PLAYBACK_PERIOD_SIZE		0x48
+#define REG_CC_PLAYBACK_POSITION		0x50
+
+#define REG_BAR2_DESIGN_TYPE_AND_VERSION	0x60
+#define REG_BAR2_DEVICE_ID			0x68
 
 struct holoplot_pci_priv {
 	struct pci_dev *pci;
@@ -80,40 +103,55 @@ struct holoplot_pci_priv {
 
 static u64 holoplot_pci_read_cc_reg(struct holoplot_pci_priv *priv, u64 reg)
 {
-	return readq(priv->bar2 + reg);
+	return readq(priv->bar4 + reg);
 }
 
 static void holoplot_pci_write_cc_reg(struct holoplot_pci_priv *priv,
 				      u64 reg, u64 value)
 {
-	writeq(value, priv->bar2 + reg);
+	writeq(value, priv->bar4 + reg);
+}
+
+static void holoplot_pci_write_reg(struct holoplot_pci_priv *priv,
+				   u32 reg, u32 value)
+{
+	writel(value, priv->bar0 + reg);
+}
+
+static u32 holoplot_pci_read_reg(struct holoplot_pci_priv *priv, u32 reg)
+{
+	return readl(priv->bar0 + reg);
 }
 
 static irqreturn_t holoplot_pci_interrupt(int irq, void *dev_id)
 {
-	struct holoplot_pci_priv *card = dev_id;
-	struct device *dev = &card->pci->dev;
+	struct holoplot_pci_priv *priv = dev_id;
+	struct device *dev = &priv->pci->dev;
 	u32 status;
 
-	status = readl(card->bar0 + 0x64);
-	writel(status, card->bar0 + 0x64);
+	status = holoplot_pci_read_reg(priv, REG_DMA_IRQ_0_STATUS);
+	holoplot_pci_write_reg(priv, REG_DMA_IRQ_0_STATUS, status);
 
 	if (status & 0x8) {
-		if (card->playback)
-			snd_pcm_period_elapsed(card->playback);
+		if (priv->playback)
+			snd_pcm_period_elapsed(priv->playback);
 
-		card->irq_count++;
+		if (priv->capture) {
+			snd_pcm_period_elapsed(priv->capture);
+		}
 
-		if (card->irq_count % 1024 == 0)
-			dev_info(dev, "interrupt 0: status 0x%08x, counter %d\n", status, card->irq_count);
+		priv->irq_count++;
+
+		if (priv->irq_count % 256 == 0)
+			dev_info(dev, "interrupt 0: status 0x%08x, counter %d\n", status, priv->irq_count);
 	}
 
-	status = readl(card->bar0 + 0xe4);
-	writel(0x8, card->bar0 + 0xe4);
+	status = holoplot_pci_read_reg(priv, REG_DMA_IRQ_1_STATUS);
+	holoplot_pci_write_reg(priv, REG_DMA_IRQ_1_STATUS, status);
 
 	if (status & 0x8) {
-		if (card->capture)
-			snd_pcm_period_elapsed(card->capture);
+		if (priv->capture)
+			snd_pcm_period_elapsed(priv->capture);
 	}
 
 	// if (status & 0x8)
@@ -233,19 +271,51 @@ holoplot_pci_capture_close(struct snd_pcm_substream *substream)
 }
 
 static int
-holoplot_pci_playback_hw_params(struct snd_pcm_substream *substream,
-				struct snd_pcm_hw_params *params)
+holoplot_pci_playback_prepare(struct snd_pcm_substream *substream)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
-
-	// FIXME
-	// holoplot_pcm_write_reg(priv, REG_CC_PLAYBACK_SRC_DST_ADDR, runtime->dma_addr);
+	u32 base = REG_AXIPCIE_INGRESS_BASE(2);
 
 	holoplot_pci_write_cc_reg(priv, REG_CC_PLAYBACK_CONTROL,
 				  REG_CC_PLAYBACK_CONTROL_RESET);
 	holoplot_pci_write_cc_reg(priv, REG_CC_PLAYBACK_BUFFER_SIZE,
 				  runtime->dma_bytes);
+
+	holoplot_pci_write_reg(priv, base + REG_AXIPCIE_INGRESS_SRC_ADDR_LO,
+			       lower_32_bits(runtime->dma_addr));
+	holoplot_pci_write_reg(priv, base + REG_AXIPCIE_INGRESS_SRC_ADDR_HI,
+			       upper_32_bits(runtime->dma_addr));
+
+	return 0;
+}
+
+static int
+holoplot_pci_capture_prepare(struct snd_pcm_substream *substream)
+{
+	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	u32 base = REG_AXIPCIE_EGRESS_BASE(0);
+
+	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_CONTROL,
+				  REG_CC_CAPTURE_CONTROL_RESET);
+	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_BUFFER_SIZE,
+				  runtime->dma_bytes);
+
+	holoplot_pci_write_reg(priv, base + REG_AXIPCIE_EGRESS_DST_ADDR_LO,
+			       lower_32_bits(runtime->dma_addr));
+	holoplot_pci_write_reg(priv, base + REG_AXIPCIE_EGRESS_DST_ADDR_HI,
+			       upper_32_bits(runtime->dma_addr));
+
+	return 0;
+}
+
+static int
+holoplot_pci_playback_hw_params(struct snd_pcm_substream *substream,
+				struct snd_pcm_hw_params *params)
+{
+	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
+
 	holoplot_pci_write_cc_reg(priv, REG_CC_PLAYBACK_PERIOD_SIZE,
 				  params_period_bytes(params));
 
@@ -257,15 +327,7 @@ holoplot_pci_capture_hw_params(struct snd_pcm_substream *substream,
 			       struct snd_pcm_hw_params *params)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
-	struct snd_pcm_runtime *runtime = substream->runtime;
 
-	// FIXME
-	// holoplot_pcm_write_reg(priv, REG_CC_CAPTURE_SRC_DST_ADDR, runtime->dma_addr);
-
-	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_CONTROL,
-				  REG_CC_CAPTURE_CONTROL_RESET);
-	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_BUFFER_SIZE,
-				  runtime->dma_bytes);
 	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_PERIOD_SIZE,
 				  params_period_bytes(params));
 
@@ -276,7 +338,6 @@ static int
 holoplot_pci_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
-	int ret = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -293,18 +354,16 @@ holoplot_pci_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 		break;
 
 	default:
-		ret = -EINVAL;
-		break;
+		return  -EINVAL;
 	}
 
-	return ret;
+	return 0;
 }
 
 static int
 holoplot_pci_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
-	int ret = 0;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
@@ -321,11 +380,10 @@ holoplot_pci_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 		break;
 
 	default:
-		ret = -EINVAL;
-		break;
+		return -EINVAL;
 	}
 
-	return ret;
+	return 0;
 }
 
 static snd_pcm_uframes_t
@@ -349,6 +407,7 @@ holoplot_pci_capture_pointer(struct snd_pcm_substream *substream)
 static const struct snd_pcm_ops holoplot_pci_playback_ops = {
 	.open		= holoplot_pci_playback_open,
 	.close		= holoplot_pci_playback_close,
+	.prepare	= holoplot_pci_playback_prepare,
 	.hw_params	= holoplot_pci_playback_hw_params,
 	.trigger	= holoplot_pci_playback_trigger,
 	.pointer	= holoplot_pci_playback_pointer,
@@ -357,11 +416,11 @@ static const struct snd_pcm_ops holoplot_pci_playback_ops = {
 static const struct snd_pcm_ops holoplot_pci_capture_ops = {
 	.open		= holoplot_pci_capture_open,
 	.close		= holoplot_pci_capture_close,
+	.prepare	= holoplot_pci_capture_prepare,
 	.hw_params	= holoplot_pci_capture_hw_params,
 	.trigger	= holoplot_pci_capture_trigger,
 	.pointer	= holoplot_pci_capture_pointer,
 };
-
 
 #define to_priv(x) container_of(x, struct holoplot_pci_priv, misc)
 
@@ -412,6 +471,7 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 	struct device *dev = &pci->dev;
 	struct snd_card *card;
 	dma_addr_t dma_addr;
+	unsigned long bar;
 	static int devno;
 	int ret;
 
@@ -421,7 +481,7 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 		return ret;
 
 	strcpy(card->driver, KBUILD_MODNAME);
-	strcpy(card->shortname, "Holoplot holoplot_pci PCIe");
+	strcpy(card->shortname, "Holoplot PCIe");
 
 	priv = card->private_data;
 
@@ -460,6 +520,27 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 		return -EBUSY;
 	}
 
+
+
+	writel(0xcccccccc, priv->bar0 + 0xdc);
+
+	// write the DMA buffer address to the scratch pad register
+	writel(lower_32_bits(dma_addr), priv->bar0 + 0xd0);
+	writel(upper_32_bits(dma_addr), priv->bar0 + 0xd4);
+
+
+
+
+	/* Ingress is used for playback */
+	bar = pci_resource_start(pci, 4); // FIXME
+	holoplot_pci_write_reg(priv, REG_AXIPCIE_INGRESS_BASE(2) + REG_AXIPCIE_INGRESS_SRC_ADDR_LO, lower_32_bits(bar));
+	holoplot_pci_write_reg(priv, REG_AXIPCIE_INGRESS_BASE(2) + REG_AXIPCIE_INGRESS_SRC_ADDR_HI, upper_32_bits(bar));
+
+	/* Egress is used for capture */
+	holoplot_pci_write_reg(priv, REG_AXIPCIE_EGRESS_BASE(0) + REG_AXIPCIE_EGRESS_SRC_ADDR_LO, lower_32_bits(REMOTE_EGRESS_SOURCE));
+	holoplot_pci_write_reg(priv, REG_AXIPCIE_EGRESS_BASE(0) + REG_AXIPCIE_EGRESS_SRC_ADDR_HI, upper_32_bits(REMOTE_EGRESS_SOURCE));
+	holoplot_pci_write_cc_reg(priv, REG_CC_CAPTURE_SRC_ADDR, REMOTE_EGRESS_SOURCE);
+
 	ret = snd_pcm_new(card, card->driver, 0, 1, 1, &priv->pcm);
 	if (ret < 0)
 		return ret;
@@ -476,21 +557,11 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 	snd_pcm_set_managed_buffer_all(priv->pcm, SNDRV_DMA_TYPE_DEV, dev,
 				       BUFFER_BYTES_MAX / 2, BUFFER_BYTES_MAX);
 
-
-
 	priv->dma_buf = dmam_alloc_coherent(dev, SZ_16M, &dma_addr, GFP_KERNEL);
 	if (!priv->dma_buf) {
 		dev_err(dev, "cannot allocate DMA buffer\n");
 		return -ENOMEM;
 	}
-
-	// write the DMA buffer address to the scratch pad register
-	writel(lower_32_bits(dma_addr), priv->bar0 + 0xd0);
-	writel(upper_32_bits(dma_addr), priv->bar0 + 0xd4);
-
-	wmb();
-
-	writel(0xcccccccc, priv->bar0 + 0xdc);
 
 	priv->misc.minor = MISC_DYNAMIC_MINOR;
 	priv->misc.fops = &holoplot_pci_misc_fops;
@@ -508,10 +579,10 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 	if (ret < 0)
 		return ret;
 
-	dev_info(&pci->dev, "Holoplot PCIe card probed. bar0=%px, bar4=%px irq=%d\n",
+	dev_info(dev, "Holoplot PCIe card probed. bar0=%px, bar4=%px irq=%d\n",
 		 priv->bar0, priv->bar4, pci->irq);
 
-	dev_info(&pci->dev, "DMA buffer at physical 0x%llx virtual 0x%px -- content 0x%llx\n", dma_addr, priv->dma_buf, *(u64*) priv->dma_buf);
+	dev_info(dev, "DMA buffer at physical 0x%llx virtual 0x%px -- content 0x%llx\n", dma_addr, priv->dma_buf, *(u64*) priv->dma_buf);
 
 	return 0;
 }
