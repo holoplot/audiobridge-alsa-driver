@@ -1,22 +1,20 @@
 #include <linux/compiler.h>
-#include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
-#include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
-#include <asm-generic/io.h>
-#include <asm/io.h>
-#include <linux/ktime.h>
 
 #include <sound/core.h>
-#include <sound/pcm.h>
-#include <sound/pcm_params.h>
+#include <sound/hwdep.h>
 #include <sound/initval.h>
+#include <sound/pcm_params.h>
+#include <sound/pcm.h>
+
+#include "holoplot_pci.h"
 
 #ifndef PCI_VENDOR_ID_HOLOPLOT
 #define PCI_VENDOR_ID_HOLOPLOT 0x2081
@@ -32,65 +30,12 @@ static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 module_param_array(id, charp, NULL, 0444);
 MODULE_PARM_DESC(id, "ID string for the Holoplut PCIe soundcard.");
 
-#define BUFFER_BYTES_MAX	SZ_1M
-#define PERIOD_BYTES_MIN	32
-#define PERIOD_BYTES_MAX	(BUFFER_BYTES_MAX / 2)
-#define PERIODS_MIN		2
-#define PERIODS_MAX		(BUFFER_BYTES_MAX / PERIOD_BYTES_MIN)
-
-/* ... */
-#define REMOTE_EGRESS_SOURCE	0xe8000000
-
-/* Registers mapped on BAR0 */
-#define REG_AXIPCIE_MAIN_BASE		0x8000
-
-#define REG_AXIPCIE_INGRESS_BASE(X)	(0x8800 + (X)*0x20)
-#define REG_AXIPCIE_INGRESS_CONTROL	0x08
-#define REG_AXIPCIE_INGRESS_SRC_ADDR_LO	0x10
-#define REG_AXIPCIE_INGRESS_SRC_ADDR_HI	0x14
-#define REG_AXIPCIE_INGRESS_DST_ADDR_LO 0x18
-#define REG_AXIPCIE_INGRESS_DST_ADDR_HI 0x1c
-
-#define REG_AXIPCIE_EGRESS_BASE(X)	(0x8c00 + (X)*0x20)
-#define REG_AXIPCIE_EGRESS_CONTROL	0x08
-#define REG_AXIPCIE_EGRESS_SRC_ADDR_LO	0x10
-#define REG_AXIPCIE_EGRESS_SRC_ADDR_HI	0x14
-#define REG_AXIPCIE_EGRESS_DST_ADDR_LO	0x18
-#define REG_AXIPCIE_EGRESS_DST_ADDR_HI	0x1c
-
-#define REG_DMA_IRQ_0_STATUS		0x64
-#define REG_DMA_IRQ_1_STATUS		0xe4
-
-/* Registers mapped on BAR2 */
-#define REG_CC_CAPTURE_CONTROL			0x00
-#define REG_CC_CAPTURE_CONTROL_RUN		BIT(0)
-#define REG_CC_CAPTURE_CONTROL_RESET		BIT(1)
-#define REG_CC_CAPTURE_SRC_ADDR			0x08
-#define REG_CC_CAPTURE_BUFFER_SIZE		0x10
-#define REG_CC_CAPTURE_PERIOD_SIZE		0x18
-#define REG_CC_CAPTURE_POSITION			0x20
-
-#define REG_CC_PLAYBACK_CONTROL			0x30
-#define REG_CC_PLAYBACK_CONTROL_RUN		BIT(0)
-#define REG_CC_PLAYBACK_CONTROL_RESET		BIT(1)
-#define REG_CC_PLAYBACK_SRC_ADDR		0x38
-#define REG_CC_PLAYBACK_BUFFER_SIZE		0x40
-#define REG_CC_PLAYBACK_PERIOD_SIZE		0x48
-#define REG_CC_PLAYBACK_POSITION		0x50
-
-#define REG_BAR2_DESIGN_TYPE_AND_VERSION	0x60
-#define REG_BAR2_DEVICE_ID			0x68
-
 struct holoplot_pci_priv {
 	struct pci_dev *pci;
 
-	void __iomem *bar0; /* Mapped to the Xilinx DMA register space */
+	void __iomem *bar0; /* Xilinx DMA and PCIe bridge register spaces */
 	void __iomem *bar2; /* Device info and control */
 	void __iomem *bar4; /* Playback audio data */
-
-	void *dma_buf;
-
-	struct miscdevice misc;
 
 	struct snd_pcm *pcm;
         struct snd_pcm_substream *playback;
@@ -422,53 +367,35 @@ static const struct snd_pcm_ops holoplot_pci_capture_ops = {
 	.pointer	= holoplot_pci_capture_pointer,
 };
 
-#define to_priv(x) container_of(x, struct holoplot_pci_priv, misc)
+/* SysFs*/
 
-static ssize_t
-holoplot_pci_misc_read(struct file *file, char __user *buf,
-		       size_t count, loff_t *ppos)
+static ssize_t device_id_show(struct device *dev,
+			      struct device_attribute *attr, char *buf)
 {
-	struct holoplot_pci_priv *priv = to_priv(file->private_data);
-
-	dev_info(&priv->pci->dev, "DMA buffer content 0x%llx now %llu\n",
-		*(u64*) priv->dma_buf, ktime_get_ns());
-
 	return 0;
 }
+static DEVICE_ATTR_RO(device_id);
 
-static ssize_t
-holoplot_pci_misc_write(struct file *file, const char __user *buf,
-			size_t count, loff_t *ppos)
-{
-	struct holoplot_pci_priv *card = to_priv(file->private_data);
-	u64 v;
-
-	card->foo++;
-	v = 0xdead0000 + card->foo;
-
-	printk(KERN_ERR "XXXXXXXXX holoplot_pci_misc_read -> %08llx\n", v);
-
-	writeq(v, card->bar4);
-
-	return count;
-}
-
-static const struct file_operations holoplot_pci_misc_fops =
-{
-	.read = holoplot_pci_misc_read,
-	.write = holoplot_pci_misc_write,
+static struct attribute *holoplot_pci_dev_attrs[] = {
+	&dev_attr_device_id.attr,
+	NULL,
 };
 
-static void holoplot_pci_misc_deregister(void *misc)
-{
-	misc_deregister(misc);
-}
+static const struct attribute_group holoplot_pci_dev_attr_group = {
+	.attrs = holoplot_pci_dev_attrs,
+};
+
+static const struct attribute_group *holoplot_pci_dev_attr_groups[] = {
+	&holoplot_pci_dev_attr_group,
+	NULL,
+};
 
 static int holoplot_pci_probe(struct pci_dev *pci,
 			      const struct pci_device_id *pci_id)
 {
 	struct holoplot_pci_priv *priv;
 	struct device *dev = &pci->dev;
+	struct snd_hwdep *hwdep;
 	struct snd_card *card;
 	dma_addr_t dma_addr;
 	unsigned long bar;
@@ -557,23 +484,16 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 	snd_pcm_set_managed_buffer_all(priv->pcm, SNDRV_DMA_TYPE_DEV, dev,
 				       BUFFER_BYTES_MAX / 2, BUFFER_BYTES_MAX);
 
-	priv->dma_buf = dmam_alloc_coherent(dev, SZ_16M, &dma_addr, GFP_KERNEL);
-	if (!priv->dma_buf) {
-		dev_err(dev, "cannot allocate DMA buffer\n");
-		return -ENOMEM;
-	}
-
-	priv->misc.minor = MISC_DYNAMIC_MINOR;
-	priv->misc.fops = &holoplot_pci_misc_fops;
-	priv->misc.name = KBUILD_MODNAME;
-
-	ret = misc_register(&priv->misc);
+	ret = snd_hwdep_new(card, KBUILD_MODNAME, 0, &hwdep);
 	if (ret < 0)
 		return ret;
 
-	ret = devm_add_action_or_reset(dev, holoplot_pci_misc_deregister, &priv->misc);
-	if (ret < 0)
-		return ret;
+	hwdep->iface = SNDRV_HWDEP_IFACE_HOLOPLOT_PCI;
+	hwdep->private_data = priv;
+
+	/* for sysfs */
+	hwdep->dev->groups = holoplot_pci_dev_attr_groups;
+	dev_set_drvdata(hwdep->dev, priv);
 
 	ret = snd_card_register(card);
 	if (ret < 0)
@@ -581,8 +501,6 @@ static int holoplot_pci_probe(struct pci_dev *pci,
 
 	dev_info(dev, "Holoplot PCIe card probed. bar0=%px, bar4=%px irq=%d\n",
 		 priv->bar0, priv->bar4, pci->irq);
-
-	dev_info(dev, "DMA buffer at physical 0x%llx virtual 0x%px -- content 0x%llx\n", dma_addr, priv->dma_buf, *(u64*) priv->dma_buf);
 
 	return 0;
 }
