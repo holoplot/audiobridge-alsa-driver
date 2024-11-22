@@ -40,6 +40,8 @@ struct holoplot_pci_priv {
 	void __iomem *bar0; /* Xilinx DMA register spaces */
 	void __iomem *bar2; /* PCM transport control */
 
+	int bar2_phys;
+
 	struct snd_pcm *pcm;
 	struct snd_pcm_substream *playback;
 	struct snd_pcm_substream *capture;
@@ -49,6 +51,9 @@ struct holoplot_pci_priv {
 
 	u32 misc_read_done;
 	u32 misc_write_done;
+
+	char device_id[sizeof(u64)+1];
+	u32 fpga_design_type, fpga_design_version;
 
 	bool card_registered;
 	struct work_struct card_ready_work;
@@ -81,8 +86,13 @@ static void holoplot_pci_write_audio_dma_reg(struct holoplot_pci_priv *priv, u64
 
 /* Misc registers are accessed indirectly through BAR 0 and IRQs */
 
-static void holoplot_pci_assert_irq(struct holoplot_pci_priv *priv, u32 channel)
+static void holoplot_pci_assert_irq(struct holoplot_pci_priv *priv, u32 channel, u32 cmd)
 {
+	holoplot_pci_write_pcie_dma_reg(priv, channel,
+					REG_DMA_CHANNEL_SCRATCH_0, cmd);
+
+	wmb();
+
 	holoplot_pci_write_pcie_dma_reg(priv, channel,
 					REG_DMA_CHANNEL_AXI_IRQ_CONTROL, 0x1);
 	holoplot_pci_write_pcie_dma_reg(priv, channel,
@@ -95,25 +105,23 @@ static int holoplot_pci_read_misc_reg(struct holoplot_pci_priv *priv, u32 reg, u
 	u32 hi, lo;
 
 	holoplot_pci_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
-					REG_DMA_CHANNEL_SCRATCH_0, reg);
+					REG_DMA_CHANNEL_SCRATCH_1, reg);
 
 	priv->misc_read_done = 0;
 
-	holoplot_pci_assert_irq(priv, DMA_CHANNEL_MISC_READ);
+	holoplot_pci_assert_irq(priv, DMA_CHANNEL_MISC_READ,
+				MISC_INTERRUPT_REQUEST);
 
 	ret = wait_event_interruptible_timeout(priv->misc_read_wait,
 					       priv->misc_read_done,
 					       MISC_TRANSACTION_TIMEOUT);
 	if (ret == 0)
-		ret = -ETIMEDOUT;
-
-	if (ret < 0)
-		return ret;
+		return -ETIMEDOUT;
 
 	lo = holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
-					    REG_DMA_CHANNEL_SCRATCH_0);
+					    REG_DMA_CHANNEL_SCRATCH_2);
 	hi = holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
-					    REG_DMA_CHANNEL_SCRATCH_1);
+					    REG_DMA_CHANNEL_SCRATCH_3);
 
 	*val = ((u64) hi << 32) | lo;
 
@@ -124,24 +132,27 @@ static int holoplot_pci_write_misc_reg(struct holoplot_pci_priv *priv, u32 reg, 
 {
 	int ret;
 
+	printk(KERN_ERR "XXX %s() %d\n", __func__, __LINE__);
+
 	holoplot_pci_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
-					REG_DMA_CHANNEL_SCRATCH_0, reg);
+					REG_DMA_CHANNEL_SCRATCH_1, reg);
 	holoplot_pci_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
-					REG_DMA_CHANNEL_SCRATCH_1, lower_32_bits(val));
+					REG_DMA_CHANNEL_SCRATCH_2, lower_32_bits(val));
 	holoplot_pci_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
-					REG_DMA_CHANNEL_SCRATCH_2, upper_32_bits(val));
+					REG_DMA_CHANNEL_SCRATCH_3, upper_32_bits(val));
 
 	priv->misc_write_done = 0;
 
-	holoplot_pci_assert_irq(priv, DMA_CHANNEL_MISC_WRITE);
+	holoplot_pci_assert_irq(priv, DMA_CHANNEL_MISC_WRITE,
+				MISC_INTERRUPT_REQUEST);
 
 	ret = wait_event_interruptible_timeout(priv->misc_write_wait,
 					       priv->misc_write_done,
 					       MISC_TRANSACTION_TIMEOUT);
 	if (ret == 0)
-		ret = -ETIMEDOUT;
+		return -ETIMEDOUT;
 
-	return ret;
+	return 0;
 }
 
 static u32 holoplot_pci_read_interrupt(struct holoplot_pci_priv *priv, u32 channel)
@@ -176,30 +187,34 @@ static irqreturn_t holoplot_pci_interrupt(int irq, void *dev_id)
 	}
 
 	status = holoplot_pci_read_interrupt(priv, DMA_CHANNEL_MISC_READ);
+	printk(KERN_ERR "XXX %s() %d status %08x\n", __func__, __LINE__, status);
 	if (status & 0x8) {
-		u32 v= holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
-						      REG_DMA_CHANNEL_SCRATCH_0);
-		switch (v) {
+		u32 cmd = holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
+							 REG_DMA_CHANNEL_SCRATCH_0);
+		switch (cmd) {
 		case MISC_INTERRUPT_INIT_DONE:
+			printk(KERN_INFO "XXX %s() %d  INIT DONE\n", __func__, __LINE__);
 			schedule_work(&priv->card_ready_work);
 			break;
 
 		case MISC_INTERRUPT_REPLY:
+			printk(KERN_INFO "XXX %s() %d  REPLY\n", __func__, __LINE__);
 			WRITE_ONCE(priv->misc_read_done, 1);
 			wake_up(&priv->misc_read_wait);
 			break;
 
 		default:
-			dev_err(dev, "unhandled misc interrupt %08x\n", v);
+			dev_err(dev, "unhandled misc interrupt %08x\n", cmd);
 			break;
 		}
 	}
 
 	status = holoplot_pci_read_interrupt(priv, DMA_CHANNEL_MISC_WRITE);
+	printk(KERN_ERR "XXX %s() %d status %08x\n", __func__, __LINE__, status);
 	if (status & 0x8) {
-		u32 v= holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
-						      REG_DMA_CHANNEL_SCRATCH_0);
-		switch (v) {
+		u32 cmd = holoplot_pci_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
+							 REG_DMA_CHANNEL_SCRATCH_0);
+		switch (cmd) {
 		case MISC_INTERRUPT_INIT_DONE:
 			schedule_work(&priv->card_ready_work);
 			break;
@@ -210,7 +225,7 @@ static irqreturn_t holoplot_pci_interrupt(int irq, void *dev_id)
 			break;
 
 		default:
-			dev_err(dev, "unhandled misc interrupt %08x\n", v);
+			dev_err(dev, "unhandled misc interrupt %08x\n", cmd);
 			break;
 		}
 	}
@@ -345,20 +360,26 @@ holoplot_pci_playback_prepare(struct snd_pcm_substream *substream)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
 
 	spin_lock_irq(&priv->lock);
 
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_PLAYBACK_CONTROL,
-				  REG_CC_PLAYBACK_CONTROL_RESET);
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_PLAYBACK_BUFFER_SIZE,
-				  runtime->dma_bytes);
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_PLAYBACK_OFFSET +
+					 REG_PCM_CONTROL,
+					 REG_PCM_CONTROL_RESET);
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_PLAYBACK_OFFSET +
+					 REG_PCM_BUFFER_SIZE,
+					 runtime->dma_bytes);
 
-	// holoplot_pci_write_ingress_reg(priv, REG_AXIPCIE_INGRESS_SRC_ADDR_LO,
-	// 			       lower_32_bits(runtime->dma_addr));
-	// holoplot_pci_write_ingress_reg(priv, REG_AXIPCIE_INGRESS_SRC_ADDR_HI,
-	// 			       upper_32_bits(runtime->dma_addr));
+	ret = holoplot_pci_write_misc_reg(priv, REG_MISC_PLAYBACK_SRC_ADDR,
+					  runtime->dma_addr);
 
 	spin_unlock_irq(&priv->lock);
+
+	if (ret < 0) {
+		dev_err(&priv->pci->dev, "error writing playback source address\n");
+		return ret;
+	}
 
 	return 0;
 }
@@ -368,18 +389,23 @@ holoplot_pci_capture_prepare(struct snd_pcm_substream *substream)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
 
 	spin_lock_irq(&priv->lock);
 
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_CONTROL,
-				  REG_CC_CAPTURE_CONTROL_RESET);
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_BUFFER_SIZE,
-				  runtime->dma_bytes);
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_CAPTURE_OFFSET +
+					 REG_PCM_CONTROL,
+					 REG_PCM_CONTROL_RESET);
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_CAPTURE_OFFSET +
+					 REG_PCM_BUFFER_SIZE,
+					 runtime->dma_bytes);
 
-	// holoplot_pci_write_egress_reg(priv, REG_AXIPCIE_EGRESS_DST_ADDR_LO,
-	// 			      lower_32_bits(runtime->dma_addr));
-	// holoplot_pci_write_egress_reg(priv, REG_AXIPCIE_EGRESS_DST_ADDR_HI,
-	// 			      upper_32_bits(runtime->dma_addr));
+	ret = holoplot_pci_write_misc_reg(priv, REG_MISC_CAPTURE_DST_ADDR,
+					  runtime->dma_addr);
+	if (ret < 0) {
+		dev_err(&priv->pci->dev, "error writing capture destination address\n");
+		return ret;
+	}
 
 	spin_unlock_irq(&priv->lock);
 
@@ -393,8 +419,9 @@ holoplot_pci_playback_hw_params(struct snd_pcm_substream *substream,
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
 	struct snd_pcm_runtime *runtime = substream->runtime;
 
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_PLAYBACK_PERIOD_SIZE,
-				  params_period_bytes(params));
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_PLAYBACK_OFFSET +
+					 REG_PCM_PERIOD_SIZE,
+					 params_period_bytes(params));
 
 	return 0;
 }
@@ -408,8 +435,9 @@ holoplot_pci_capture_hw_params(struct snd_pcm_substream *substream,
 
 	printk(KERN_INFO "holoplot_pci_capture_hw_params period bytes %d, buffer size %ld\n", params_period_bytes(params), runtime->dma_bytes);
 
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_PERIOD_SIZE,
-				  params_period_bytes(params));
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_CAPTURE_OFFSET +
+					 REG_PCM_PERIOD_SIZE,
+					 params_period_bytes(params));
 
 	return 0;
 }
@@ -429,9 +457,10 @@ holoplot_pci_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 		// 				    PCI_EXP_DPC_CAP_DL_ACTIVE,
 		// 				    PCI_EXP_DPC_CAP_DL_ACTIVE);
 
-		holoplot_pci_write_audio_dma_reg(priv, REG_CC_PLAYBACK_CONTROL,
-					  REG_CC_PLAYBACK_CONTROL_RUN);
-
+		holoplot_pci_write_audio_dma_reg(priv,
+						 REG_PCM_PLAYBACK_OFFSET +
+						 REG_PCM_CONTROL,
+						 REG_PCM_CONTROL_RUN);
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
@@ -441,7 +470,9 @@ holoplot_pci_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 		// 				    REG_AXIPCIE_EGRESS_CONTROL,
 		// 				    PCI_EXP_DPC_CAP_DL_ACTIVE, 0);
 
-		holoplot_pci_write_audio_dma_reg(priv, REG_CC_PLAYBACK_CONTROL, 0);
+		holoplot_pci_write_audio_dma_reg(priv,
+						 REG_PCM_PLAYBACK_OFFSET +
+						 REG_PCM_CONTROL, 0);
 		break;
 
 	default:
@@ -460,14 +491,18 @@ holoplot_pci_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_CONTROL,
-					  REG_CC_CAPTURE_CONTROL_RUN);
+		holoplot_pci_write_audio_dma_reg(priv,
+						 REG_PCM_CAPTURE_OFFSET +
+						 REG_PCM_CONTROL,
+						 REG_PCM_CONTROL_RUN);
 		break;
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_CONTROL, 0);
+		holoplot_pci_write_audio_dma_reg(priv,
+						 REG_PCM_CAPTURE_OFFSET +
+						 REG_PCM_CONTROL, 0);
 		break;
 
 	default:
@@ -481,7 +516,8 @@ static snd_pcm_uframes_t
 holoplot_pci_playback_pointer(struct snd_pcm_substream *substream)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
-	u64 pos = holoplot_pci_read_audio_dma_reg(priv, REG_CC_PLAYBACK_POSITION);
+	u64 pos = holoplot_pci_read_audio_dma_reg(priv, REG_PCM_PLAYBACK_OFFSET +
+						  REG_PCM_POSITION);
 
 	return bytes_to_frames(substream->runtime, pos);
 }
@@ -490,7 +526,8 @@ static snd_pcm_uframes_t
 holoplot_pci_capture_pointer(struct snd_pcm_substream *substream)
 {
 	struct holoplot_pci_priv *priv = snd_pcm_substream_chip(substream);
-	u64 pos = holoplot_pci_read_audio_dma_reg(priv, REG_CC_CAPTURE_POSITION);
+	u64 pos = holoplot_pci_read_audio_dma_reg(priv, REG_PCM_CAPTURE_OFFSET +
+						  REG_PCM_POSITION);
 
 	return bytes_to_frames(substream->runtime, pos);
 }
@@ -519,19 +556,14 @@ static ssize_t device_id_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
 	struct holoplot_pci_priv *priv = dev_get_drvdata(dev);
-	u64 v;
 	int i;
 
-	v = holoplot_pci_read_audio_dma_reg(priv, REG_BAR2_DEVICE_ID);
-
-	for (i = 0; i < 8; i++) {
-		buf[i] = (int) (v >> (56 - i * 8)) & 0xff;
-
-		if (buf[i] == 0 || buf[i] == 0xff)
-			break;
+	for (i = 0; i < sizeof(priv->device_id); i++) {
+		buf[i] = priv->device_id[i];
 	}
 
-	buf[i] = '\n';
+	buf[i++] = '\n';
+	buf[i] = '\0';
 
 	return i;
 }
@@ -541,13 +573,8 @@ static ssize_t fpga_design_type_show(struct device *dev,
 				     struct device_attribute *attr, char *buf)
 {
 	struct holoplot_pci_priv *priv = dev_get_drvdata(dev);
-	u64 v;
 
-	v = holoplot_pci_read_audio_dma_reg(priv, REG_BAR2_DESIGN_TYPE_AND_VERSION);
-	v >>= DESIGN_TYPE_SHIFT;
-	v &= DESIGN_TYPE_MASK;
-
-	return sysfs_emit(buf, "%02x\n", (u32) v);
+	return sysfs_emit(buf, "%02x\n", priv->fpga_design_type);
 }
 static DEVICE_ATTR_RO(fpga_design_type);
 
@@ -555,13 +582,8 @@ static ssize_t fpga_design_version_show(struct device *dev,
 					struct device_attribute *attr, char *buf)
 {
 	struct holoplot_pci_priv *priv = dev_get_drvdata(dev);
-	u64 v;
 
-	v = holoplot_pci_read_audio_dma_reg(priv, REG_BAR2_DESIGN_TYPE_AND_VERSION);
-	v >>= DESIGN_VERSION_SHIFT;
-	v &= DESIGN_VERSION_MASK;
-
-	return sysfs_emit(buf, "%02x\n", (u32) v);
+	return sysfs_emit(buf, "%02x\n", priv->fpga_design_version);
 }
 static DEVICE_ATTR_RO(fpga_design_version);
 
@@ -586,15 +608,11 @@ holoplot_pci_proc_read(struct snd_info_entry *entry,
 		       struct snd_info_buffer *buffer)
 {
 	struct holoplot_pci_priv *priv = entry->private_data;
-	u64 v;
 
 	snd_iprintf(buffer, "PCI location: %s\n", dev_name(&priv->pci->dev));
-
-	v = holoplot_pci_read_audio_dma_reg(priv, REG_BAR2_DESIGN_TYPE_AND_VERSION);
-	snd_iprintf(buffer, "FPGA design type: %02x\n",
-		    (u32) ((v & DESIGN_TYPE_MASK) & DESIGN_TYPE_SHIFT));
-	snd_iprintf(buffer, "FPGA design version: %02x\n",
-		    (u32) ((v & DESIGN_VERSION_MASK) >> DESIGN_VERSION_SHIFT));
+	snd_iprintf(buffer, "Device ID: %s\n", priv->device_id);
+	snd_iprintf(buffer, "FPGA design type: %02x\n", priv->fpga_design_type);
+	snd_iprintf(buffer, "FPGA design version: %02x\n", priv->fpga_design_version);
 }
 
 static void holoplot_pci_card_ready(struct work_struct *work)
@@ -602,19 +620,55 @@ static void holoplot_pci_card_ready(struct work_struct *work)
 	struct holoplot_pci_priv *priv =
 		container_of(work, struct holoplot_pci_priv, card_ready_work);
 	unsigned long flags;
+	int ret, i;
+	u64 v;
+
+	ret = holoplot_pci_write_misc_reg(priv, REG_MISC_PCM_CONTROL_BASE, priv->bar2_phys);
+	if (ret < 0) {
+		dev_err(&priv->pci->dev,
+			"error writing PCM control base: %d\n", ret);
+		return;
+	}
+
+	ret = holoplot_pci_read_misc_reg(priv, REG_MISC_DESIGN_TYPE_VERSION, &v);
+	if (ret < 0) {
+		dev_err(&priv->pci->dev,
+			"error reading FPGA device info: %d\n", ret);
+		return;
+	}
+
+	priv->fpga_design_type = (v >> 32) & 0xff;
+	priv->fpga_design_version = v & 0xff;
+
+	ret = holoplot_pci_read_misc_reg(priv, REG_MISC_DEVICE_ID, &v);
+	if (ret < 0) {
+		dev_err(&priv->pci->dev, "error reading device ID: %d\n", ret);
+		return;
+	}
+
+	for (i = 0; i < 8; i++) {
+		priv->device_id[i] = (v >> (i * 8)) & 0xff;
+
+		if (priv->device_id[i] == 0 || priv->device_id[i] == 0xff)
+			break;
+	}
+
+	sprintf(priv->card->longname,
+		"Holoplot PCIe card at %s, irq %d, device ID %s",
+		pci_name(priv->pci), priv->pci->irq, priv->device_id);
 
 	if (!priv->card_registered) {
-		int ret;
-
 		ret = snd_card_register(priv->card);
 		if (ret < 0) {
 			dev_err(&priv->pci->dev, "error registering card\n");
-		} else {
-			priv->card_registered = true;
-		}
-	}
 
-	printk(KERN_INFO "card ready worker\n");
+			return;
+		}
+
+		priv->card_registered = true;
+
+		dev_info(&priv->pci->dev, "card registered. Device ID %s n %llx\n", priv->device_id, v);
+	}
 }
 
 static int __holoplot_pci_probe(struct pci_dev *pci,
@@ -675,36 +729,14 @@ static int __holoplot_pci_probe(struct pci_dev *pci,
 	priv->bar0 = pcim_iomap_table(pci)[0];
 	priv->bar2 = pcim_iomap_table(pci)[2];
 
-	pci_set_master(pci);
+	priv->bar2_phys = pci_resource_start(pci, 2);
 
-	if (devm_request_irq(dev, pci->irq, holoplot_pci_interrupt,
-			     IRQF_SHARED, KBUILD_MODNAME, priv)) {
-		dev_err(dev, "cannot obtain IRQ %d\n", pci->irq);
-		return -EBUSY;
-	}
+	pci_set_master(pci);
 
 	strcpy(card->driver, KBUILD_MODNAME);
 	strcpy(card->shortname, "holoplot-pcie");
-	sprintf(card->longname, "Holoplot PCIe card at %s, irq %d",
-	        pci_name(pci), pci->irq);
-
-	ret = holoplot_pci_write_misc_reg(priv, 0x12345678, 0xffeeddccbbaa9988);
-	if (ret < 0) {
-		dev_err(dev, "error writing to misc register\n");
-	}
-
-	ret = holoplot_pci_read_misc_reg(priv, 0x12345678, &l);
-	if (ret < 0) {
-		dev_err(dev, "error reading to misc register\n");
-	} else {
-		dev_info(dev, "read from misc register: %llx\n", l);
-	}
 
 #if 0
-	/* Handshake */
-	holoplot_pci_write_pcie_dma_reg(priv, 0xdc, 0xcccccccc);
-	// writel(0xcccccccc, priv->bar0 + 0xdc);
-
 	/*
 	 * Ingress is used for playback
 	 *
@@ -737,8 +769,10 @@ static int __holoplot_pci_probe(struct pci_dev *pci,
 	holoplot_pci_write_egress_reg(priv, REG_AXIPCIE_EGRESS_CONTROL, v);
 
 	/* The internal capture source address is always the same */
-	holoplot_pci_write_audio_dma_reg(priv, REG_CC_CAPTURE_SRC_ADDR,
+	holoplot_pci_write_audio_dma_reg(priv, REG_PCM_CAPTURE_SRC_ADDR,
 				  REMOTE_EGRESS_SOURCE);
+
+#endif
 
 	/* PCM */
 	ret = snd_pcm_new(card, card->driver, 0, 1, 1, &priv->pcm);
@@ -772,10 +806,16 @@ static int __holoplot_pci_probe(struct pci_dev *pci,
 	hwdep->dev->groups = holoplot_pci_dev_attr_groups;
 	dev_set_drvdata(hwdep->dev, priv);
 
-	// ret = snd_card_register(card);
-	// if (ret < 0)
-	// 	return ret;
-#endif
+	if (devm_request_irq(dev, pci->irq, holoplot_pci_interrupt,
+			     IRQF_SHARED, KBUILD_MODNAME, priv)) {
+		dev_err(dev, "cannot obtain IRQ %d\n", pci->irq);
+		return -EBUSY;
+	}
+
+	ret = holoplot_pci_write_misc_reg(priv, REG_MISC_RESET, 1);
+	if (ret < 0) {
+		dev_err(dev, "error writing reset register\n");
+	}
 
 	dev_info(dev, "Holoplot PCIe card probed. bar0=%px, bar2=%px irq=%d\n",
 		 priv->bar0, priv->bar2, pci->irq);
