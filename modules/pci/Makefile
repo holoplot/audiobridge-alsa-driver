@@ -1,5 +1,5 @@
 ifeq ($(MODULE),)
-	MODULE := janus
+	MODULE := holoplot-ab
 endif
 
 obj-m := $(MODULE).o
