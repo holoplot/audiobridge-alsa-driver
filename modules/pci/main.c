@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/version.h>
 #include <linux/workqueue.h>
 
 #include <sound/core.h>
@@ -805,8 +806,13 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	hwdep->private_data = priv;
 
 	/* Sysfs attributes, exposed through hwdep */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 	hwdep->dev->groups = hab_dev_attr_groups;
 	dev_set_drvdata(hwdep->dev, priv);
+#else
+	hwdep->dev.groups = hab_dev_attr_groups;
+	dev_set_drvdata(&hwdep->dev, priv);
+#endif
 
 	if (devm_request_irq(dev, pci->irq, hab_interrupt,
 			     IRQF_SHARED, KBUILD_MODNAME, priv)) {
