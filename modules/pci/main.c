@@ -27,11 +27,11 @@
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 module_param_array(index, int, NULL, 0444);
-MODULE_PARM_DESC(index, "Index value for the Holoplut PCIe AudioBridge soundcard.");
+MODULE_PARM_DESC(index, "Index value for the Holoplot PCIe AudioBridge soundcard.");
 
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
 module_param_array(id, charp, NULL, 0444);
-MODULE_PARM_DESC(id, "ID string for the Holoplut PCIe AudioBridge soundcard.");
+MODULE_PARM_DESC(id, "ID string for the Holoplot PCIe AudioBridge soundcard.");
 
 struct hab_priv {
 	struct pci_dev *pci;
@@ -750,8 +750,10 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	INIT_WORK(&priv->card_ready_work, hab_card_ready);
 
 	ret = pcim_enable_device(pci);
-	if (ret < 0)
+	if (ret < 0) {
+		dev_err(dev, "error enabling PCI device\n");
 		return ret;
+	}
 
 	ret = pci_enable_msi(pci);
 	if (ret < 0) {
