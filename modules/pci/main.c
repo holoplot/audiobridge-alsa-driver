@@ -440,6 +440,8 @@ static int hab_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
+		memset(substream->runtime->dma_area, 0, substream->runtime->buffer_size);
+
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
 		hab_write_audio_dma_reg(priv,
