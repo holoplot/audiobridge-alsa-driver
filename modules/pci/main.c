@@ -703,9 +703,9 @@ static void hab_card_ready(struct work_struct *work)
 			break;
 	}
 
-	sprintf(priv->card->longname,
-		"Holoplot PCIe AudioBridge card at %s, irq %d, device ID %s",
-		pci_name(priv->pci), priv->pci->irq, priv->device_id);
+	scnprintf(priv->card->longname, sizeof(priv->card->longname),
+		  "Holoplot PCIe AudioBridge card at %s, irq %d, device ID %s",
+		  pci_name(priv->pci), priv->pci->irq, priv->device_id);
 
 	if (!priv->card_registered) {
 		ret = snd_card_register(priv->card);
