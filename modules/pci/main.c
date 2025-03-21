@@ -732,23 +732,6 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	if (devno >= SNDRV_CARDS)
 		return -ENODEV;
 
-	ret = snd_devm_card_new(dev, index[devno], id[devno], THIS_MODULE,
-				sizeof(*priv), &card);
-	if (ret < 0)
-		return ret;
-
-	priv = card->private_data;
-	priv->card = card;
-	priv->pci = pci;
-
-	spin_lock_init(&priv->lock);
-	init_waitqueue_head(&priv->misc_read_wait);
-	init_waitqueue_head(&priv->misc_write_wait);
-
-	pci_set_drvdata(pci, priv);
-
-	INIT_WORK(&priv->card_ready_work, hab_card_ready);
-
 	ret = pcim_enable_device(pci);
 	if (ret < 0) {
 		dev_err(dev, "error enabling PCI device\n");
@@ -771,6 +754,23 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 		dev_err(dev, "error mapping PCI resources.\n");
 		return ret;
 	}
+
+	ret = snd_devm_card_new(dev, index[devno], id[devno], THIS_MODULE,
+				sizeof(*priv), &card);
+	if (ret < 0)
+		return ret;
+
+	priv = card->private_data;
+	priv->card = card;
+	priv->pci = pci;
+
+	spin_lock_init(&priv->lock);
+	init_waitqueue_head(&priv->misc_read_wait);
+	init_waitqueue_head(&priv->misc_write_wait);
+
+	pci_set_drvdata(pci, priv);
+
+	INIT_WORK(&priv->card_ready_work, hab_card_ready);
 
 	priv->bar0 = pcim_iomap_table(pci)[0];
 	priv->bar2 = pcim_iomap_table(pci)[2];
