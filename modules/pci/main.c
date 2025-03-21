@@ -747,8 +747,8 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 		return ret;
 	}
 
-	if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64))) {
-		dev_err(dev, "error setting 64-bit DMA mask.\n");
+	if (dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32))) {
+		dev_err(dev, "error setting 32-bit DMA mask.\n");
 		return -ENXIO;
 	}
 
