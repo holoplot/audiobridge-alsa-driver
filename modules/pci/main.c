@@ -234,6 +234,7 @@ static const struct snd_pcm_hardware hab_playback_hw = {
 	.period_bytes_max	= PERIOD_BYTES_MAX,
 	.periods_min		= PERIODS_MIN,
 	.periods_max		= PERIODS_MAX,
+	.fifo_size		= 32,
 };
 
 static const struct snd_pcm_hardware hab_capture_hw = {
