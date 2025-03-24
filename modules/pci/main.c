@@ -185,7 +185,7 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 						REG_DMA_SCRATCH_0);
 		switch (cmd) {
 		case MISC_INTERRUPT_INIT_DONE:
-			schedule_work(&priv->card_ready_work);
+			// schedule_work(&priv->card_ready_work);
 			break;
 
 		case MISC_INTERRUPT_REPLY:
@@ -723,6 +723,9 @@ static void hab_card_ready(struct work_struct *work)
 	}
 }
 
+#define BUF_SIZE SZ_1M
+#define PERIOD_SIZE SZ_4K
+
 static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 {
 	struct device *dev = &pci->dev;
@@ -731,6 +734,8 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	struct snd_card *card;
 	static int devno;
 	int ret;
+
+	dev_info(dev, "............... Holoplot PCIe card probing.\n");
 
 	if (devno >= SNDRV_CARDS)
 		return -ENODEV;
@@ -781,6 +786,71 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	priv->bar2_phys = pci_resource_start(pci, 2);
 
 	pci_set_master(pci);
+
+	// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+	uint32_t *buf;
+	dma_addr_t buf_dma;
+
+	buf = dma_alloc_coherent(dev, BUF_SIZE, &buf_dma, GFP_KERNEL);
+	if (buf == NULL) {
+		dev_err(dev, "error allocating DMA buffer\n");
+		return -ENOMEM;
+	}
+
+	for (int i = 0; i < BUF_SIZE / sizeof(uint32_t); i++)
+		buf[i] = i;
+
+	if (devm_request_irq(dev, pci->irq, hab_interrupt,
+		IRQF_SHARED, KBUILD_MODNAME, priv)) {
+		dev_err(dev, "cannot obtain IRQ %d\n", pci->irq);
+		return -EBUSY;
+	}
+
+	/* The card may not be up yet, so just ignore the error */
+	hab_write_misc_reg(priv, REG_MISC_RESET, 1);
+
+	ret = hab_write_misc_reg(priv, REG_MISC_PCM_CONTROL_BASE, priv->bar2_phys);
+	if (ret < 0) {
+		dev_err(dev, "error writing PCM control base: %d\n", ret);
+		return ret;
+	}
+
+	hab_write_audio_dma_reg(priv,
+				REG_PCM_PLAYBACK_OFFSET + REG_PCM_CONTROL,
+				REG_PCM_CONTROL_RESET);
+	hab_write_audio_dma_reg(priv,
+				REG_PCM_PLAYBACK_OFFSET + REG_PCM_BUFFER_SIZE,
+				BUF_SIZE);
+	hab_write_audio_dma_reg(priv,
+				REG_PCM_PLAYBACK_OFFSET + REG_PCM_PERIOD_SIZE,
+				PERIOD_SIZE);
+	hab_write_audio_dma_reg(priv,
+				REG_PCM_PLAYBACK_OFFSET + REG_PCM_CHANNEL_COUNT, 1);
+
+	ret = hab_write_misc_reg(priv, REG_MISC_PLAYBACK_SRC_ADDR,
+				 buf_dma);
+	if (ret < 0) {
+		dev_err(dev, "error writing playback source address\n");
+		return ret;
+	}
+
+	ret = hab_write_misc_reg(priv, REG_MISC_PLAYBACK_SIZE, BUF_SIZE);
+	if (ret < 0) {
+		dev_err(dev, "error writing playback size\n");
+		return ret;
+	}
+
+	hab_write_audio_dma_reg(priv,
+				REG_PCM_PLAYBACK_OFFSET + REG_PCM_CONTROL,
+				REG_PCM_CONTROL_RUN);
+
+	dev_info(dev, "XXXX Holoplot PCIe card probed. bar0=%px, bar2=%px irq=%d buf 0x%px dma %llx\n",
+		priv->bar0, priv->bar2, pci->irq, buf, buf_dma);
+
+	return 0;
+
+	// XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 
 	strcpy(card->driver, KBUILD_MODNAME);
 	strcpy(card->shortname, "HAB");
