@@ -357,14 +357,14 @@ static int hab_playback_prepare(struct snd_pcm_substream *substream)
 	ret = hab_write_misc_reg(priv, REG_MISC_PLAYBACK_SRC_ADDR,
 				 runtime->dma_addr);
 	if (ret < 0) {
-		dev_err(dev, "error writing playback source address\n");
+		dev_err(dev, "writing playback source address: %d\n", ret);
 		return ret;
 	}
 
 	ret = hab_write_misc_reg(priv, REG_MISC_PLAYBACK_SIZE,
 				 runtime->dma_bytes);
 	if (ret < 0) {
-		dev_err(dev, "error writing playback size\n");
+		dev_err(dev, "writing playback size: %d\n", ret);
 		return ret;
 	}
 
@@ -388,14 +388,14 @@ static int hab_capture_prepare(struct snd_pcm_substream *substream)
 	ret = hab_write_misc_reg(priv, REG_MISC_CAPTURE_DST_ADDR,
 				 runtime->dma_addr);
 	if (ret < 0) {
-		dev_err(dev, "error writing capture destination address\n");
+		dev_err(dev, "writing capture destination address: %d\n", ret);
 		return ret;
 	}
 
 	ret = hab_write_misc_reg(priv, REG_MISC_CAPTURE_SIZE,
 				 runtime->dma_bytes);
 	if (ret < 0) {
-		dev_err(dev, "error writing capture size\n");
+		dev_err(dev, "writing capture size: %d\n", ret);
 		return ret;
 	}
 
