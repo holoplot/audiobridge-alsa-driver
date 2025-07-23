@@ -3,6 +3,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/io.h>
+#include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/pci.h>
@@ -84,6 +85,35 @@ static u64 hab_read_audio_dma_reg(struct hab_priv *priv, u64 reg)
 static void hab_write_audio_dma_reg(struct hab_priv *priv, u64 reg, u64 val)
 {
 	writeq(val, priv->bar2 + reg);
+}
+
+static void hab_write_audio_dma_reset(struct hab_priv *priv, u64 offset)
+{
+	hab_write_audio_dma_reg(priv, offset + REG_PCM_CONTROL,
+				REG_PCM_CONTROL_RESET);
+}
+
+static int hab_write_audio_dma_run(struct hab_priv *priv, u64 offset, bool run)
+{
+	void __iomem *reg = priv->bar2 + offset + REG_PCM_CONTROL;
+	u64 val = run ? REG_PCM_CONTROL_RUN : 0;
+
+	writeq(val, reg);
+
+	if (!run) {
+		u64 r;
+
+		/*
+		 * The RUN bit will be cleared by the hardware only after the
+		 * current DMA period has been processed.
+		 * Wait for that to happen.
+		 */
+		return read_poll_timeout_atomic(readq, r,
+						(r & REG_PCM_CONTROL_RUN) == 0,
+						10, 1000, false, reg);
+	}
+
+	return 0;
 }
 
 /* Misc registers are accessed indirectly through BAR 0 and IRQs */
@@ -322,6 +352,8 @@ static int hab_playback_close(struct snd_pcm_substream *substream)
 {
 	struct hab_priv *priv = snd_pcm_substream_chip(substream);
 
+	hab_write_audio_dma_reset(priv, REG_PCM_PLAYBACK_OFFSET);
+
 	spin_lock_irq(&priv->lock);
 	priv->playback = NULL;
 	spin_unlock_irq(&priv->lock);
@@ -332,6 +364,8 @@ static int hab_playback_close(struct snd_pcm_substream *substream)
 static int hab_capture_close(struct snd_pcm_substream *substream)
 {
 	struct hab_priv *priv = snd_pcm_substream_chip(substream);
+
+	hab_write_audio_dma_reset(priv, REG_PCM_CAPTURE_OFFSET);
 
 	spin_lock_irq(&priv->lock);
 	priv->capture = NULL;
@@ -347,9 +381,8 @@ static int hab_playback_prepare(struct snd_pcm_substream *substream)
 	struct device *dev = &priv->pci->dev;
 	int ret;
 
-	hab_write_audio_dma_reg(priv,
-				REG_PCM_PLAYBACK_OFFSET + REG_PCM_CONTROL,
-				REG_PCM_CONTROL_RESET);
+	hab_write_audio_dma_reset(priv, REG_PCM_PLAYBACK_OFFSET);
+
 	hab_write_audio_dma_reg(priv,
 				REG_PCM_PLAYBACK_OFFSET + REG_PCM_BUFFER_SIZE,
 				runtime->dma_bytes);
@@ -378,9 +411,8 @@ static int hab_capture_prepare(struct snd_pcm_substream *substream)
 	struct device *dev = &priv->pci->dev;
 	int ret;
 
-	hab_write_audio_dma_reg(priv,
-				REG_PCM_CAPTURE_OFFSET + REG_PCM_CONTROL,
-				REG_PCM_CONTROL_RESET);
+	hab_write_audio_dma_reset(priv, REG_PCM_CAPTURE_OFFSET);
+
 	hab_write_audio_dma_reg(priv,
 				REG_PCM_CAPTURE_OFFSET + REG_PCM_BUFFER_SIZE,
 				runtime->dma_bytes);
@@ -442,23 +474,17 @@ static int hab_playback_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		hab_write_audio_dma_reg(priv,
-					REG_PCM_PLAYBACK_OFFSET + REG_PCM_CONTROL,
-					REG_PCM_CONTROL_RUN);
-		break;
+		return hab_write_audio_dma_run(priv,
+					       REG_PCM_PLAYBACK_OFFSET, true);
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		hab_write_audio_dma_reg(priv,
-					REG_PCM_PLAYBACK_OFFSET + REG_PCM_CONTROL, 0);
-		break;
-
-	default:
-		return  -EINVAL;
+		return hab_write_audio_dma_run(priv,
+					       REG_PCM_PLAYBACK_OFFSET, false);
 	}
 
-	return 0;
+	return  -EINVAL;
 }
 
 static int hab_capture_trigger(struct snd_pcm_substream *substream, int cmd)
@@ -469,24 +495,17 @@ static int hab_capture_trigger(struct snd_pcm_substream *substream, int cmd)
 	case SNDRV_PCM_TRIGGER_START:
 	case SNDRV_PCM_TRIGGER_RESUME:
 	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
-		hab_write_audio_dma_reg(priv,
-					REG_PCM_CAPTURE_OFFSET + REG_PCM_CONTROL,
-					REG_PCM_CONTROL_RUN);
-		break;
+		return hab_write_audio_dma_run(priv,
+					       REG_PCM_CAPTURE_OFFSET, true);
 
 	case SNDRV_PCM_TRIGGER_STOP:
 	case SNDRV_PCM_TRIGGER_SUSPEND:
 	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
-		hab_write_audio_dma_reg(priv,
-					REG_PCM_CAPTURE_OFFSET +
-					REG_PCM_CONTROL, 0);
-		break;
-
-	default:
-		return -EINVAL;
+		return hab_write_audio_dma_run(priv,
+					       REG_PCM_CAPTURE_OFFSET, false);
 	}
 
-	return 0;
+	return -EINVAL;
 }
 
 static snd_pcm_uframes_t
