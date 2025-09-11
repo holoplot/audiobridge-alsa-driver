@@ -148,7 +148,7 @@ static int hab_read_misc_reg(struct hab_priv *priv, u32 reg, u64 *val)
 	hab_assert_irq(priv, DMA_CHANNEL_MISC_READ, MISC_INTERRUPT_REQUEST);
 
 	ret = wait_event_interruptible_timeout(priv->misc_read_wait,
-					       priv->misc_read_done,
+					       READ_ONCE(priv->misc_read_done),
 					       MISC_TRANSACTION_TIMEOUT);
 	if (ret == 0) {
 		mutex_unlock(&priv->misc_read_mutex);
@@ -185,7 +185,7 @@ static int hab_write_misc_reg(struct hab_priv *priv, u32 reg, u64 val)
 	hab_assert_irq(priv, DMA_CHANNEL_MISC_WRITE, MISC_INTERRUPT_REQUEST);
 
 	ret = wait_event_interruptible_timeout(priv->misc_write_wait,
-					       priv->misc_write_done,
+					       READ_ONCE(priv->misc_write_done),
 					       MISC_TRANSACTION_TIMEOUT);
 
 	mutex_unlock(&priv->misc_write_mutex);
