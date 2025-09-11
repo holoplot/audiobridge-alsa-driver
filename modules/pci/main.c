@@ -6,6 +6,7 @@
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/version.h>
@@ -38,6 +39,9 @@ struct hab_priv {
 	struct pci_dev *pci;
 
 	spinlock_t lock;
+
+	struct mutex misc_read_mutex;
+	struct mutex misc_write_mutex;
 
 	void __iomem *bar0; /* Xilinx DMA register spaces */
 	void __iomem *bar2; /* PCM transport controls */
@@ -134,6 +138,8 @@ static int hab_read_misc_reg(struct hab_priv *priv, u32 reg, u64 *val)
 	int ret;
 	u32 hi, lo;
 
+	mutex_lock(&priv->misc_read_mutex);
+
 	hab_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
 			       REG_DMA_SCRATCH_1, reg);
 
@@ -144,13 +150,17 @@ static int hab_read_misc_reg(struct hab_priv *priv, u32 reg, u64 *val)
 	ret = wait_event_interruptible_timeout(priv->misc_read_wait,
 					       priv->misc_read_done,
 					       MISC_TRANSACTION_TIMEOUT);
-	if (ret == 0)
+	if (ret == 0) {
+		mutex_unlock(&priv->misc_read_mutex);
 		return -ETIMEDOUT;
+	}
 
 	lo = hab_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
 				   REG_DMA_SCRATCH_2);
 	hi = hab_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
 				   REG_DMA_SCRATCH_3);
+
+	mutex_unlock(&priv->misc_read_mutex);
 
 	*val = ((u64) hi << 32) | lo;
 
@@ -160,6 +170,8 @@ static int hab_read_misc_reg(struct hab_priv *priv, u32 reg, u64 *val)
 static int hab_write_misc_reg(struct hab_priv *priv, u32 reg, u64 val)
 {
 	int ret;
+
+	mutex_lock(&priv->misc_write_mutex);
 
 	hab_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
 			       REG_DMA_SCRATCH_1, reg);
@@ -175,6 +187,9 @@ static int hab_write_misc_reg(struct hab_priv *priv, u32 reg, u64 val)
 	ret = wait_event_interruptible_timeout(priv->misc_write_wait,
 					       priv->misc_write_done,
 					       MISC_TRANSACTION_TIMEOUT);
+
+	mutex_unlock(&priv->misc_write_mutex);
+
 	if (ret == 0)
 		return -ETIMEDOUT;
 
@@ -761,6 +776,8 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	priv->pci = pci;
 
 	spin_lock_init(&priv->lock);
+	mutex_init(&priv->misc_read_mutex);
+	mutex_init(&priv->misc_write_mutex);
 	init_waitqueue_head(&priv->misc_read_wait);
 	init_waitqueue_head(&priv->misc_write_wait);
 
