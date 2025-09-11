@@ -216,6 +216,8 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 	struct device *dev = &priv->pci->dev;
 	u32 status;
 
+	spin_lock(&priv->lock);
+
 	status = hab_read_interrupt(priv, DMA_CHANNEL_CAPTURE);
 	if (status && priv->capture)
 		snd_pcm_period_elapsed(priv->capture);
@@ -223,6 +225,8 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 	status = hab_read_interrupt(priv, DMA_CHANNEL_PLAYBACK);
 	if (status && priv->playback)
 		snd_pcm_period_elapsed(priv->playback);
+
+	spin_unlock(&priv->lock);
 
 	status = hab_read_interrupt(priv, DMA_CHANNEL_MISC_READ);
 	if (status) {
