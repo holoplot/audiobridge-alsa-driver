@@ -672,6 +672,44 @@ static ssize_t secondary_mac_address_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(secondary_mac_address);
 
+static ssize_t streams_enabled_show(struct device *dev,
+				    struct device_attribute *attr,
+				    char *buf)
+{
+	struct hab_priv *priv = dev_get_drvdata(dev);
+	u64 v;
+	int ret;
+
+	ret = hab_read_misc_reg(priv, REG_MISC_STREAMS_ENABLED, &v);
+	if (ret < 0)
+		return ret;
+
+	return sysfs_emit(buf, "%lld\n", v);
+}
+
+static ssize_t streams_enabled_store(struct device *cdev,
+				     struct device_attribute *attr,
+				     const char *buf, size_t count)
+{
+	struct hab_priv *priv = dev_get_drvdata(cdev);
+	u64 v;
+	int ret;
+
+	ret = kstrtoull(buf, 0, &v);
+	if (ret < 0)
+		return ret;
+
+	if (v != 0 && v != 1)
+		return -EINVAL;
+
+	ret = hab_write_misc_reg(priv, REG_MISC_STREAMS_ENABLED, v);
+	if (ret < 0)
+		return ret;
+
+	return count;
+}
+static DEVICE_ATTR_RW(streams_enabled);
+
 static struct attribute *hab_dev_attrs[] = {
 	&dev_attr_device_id.attr,
 	&dev_attr_fpga_design_type.attr,
@@ -680,6 +718,7 @@ static struct attribute *hab_dev_attrs[] = {
 	&dev_attr_secondary_ip_address.attr,
 	&dev_attr_primary_mac_address.attr,
 	&dev_attr_secondary_mac_address.attr,
+	&dev_attr_streams_enabled.attr,
 	NULL,
 };
 
