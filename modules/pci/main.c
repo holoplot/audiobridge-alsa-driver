@@ -10,7 +10,6 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/version.h>
-#include <linux/workqueue.h>
 
 #include <sound/core.h>
 #include <sound/hwdep.h>
@@ -20,6 +19,7 @@
 #include <sound/pcm.h>
 
 #include "defs.h"
+#include "net.h"
 
 #ifndef PCI_VENDOR_ID_HOLOPLOT
 #define PCI_VENDOR_ID_HOLOPLOT 0x2081
@@ -52,11 +52,11 @@ struct hab_priv {
 	struct snd_pcm_substream *playback;
 	struct snd_pcm_substream *capture;
 
-	wait_queue_head_t misc_read_wait;
-	wait_queue_head_t misc_write_wait;
+	wait_queue_head_t misc_read_reg_wait;
+	wait_queue_head_t misc_reg_write_wait;
 
-	u32 misc_read_done;
-	u32 misc_write_done;
+	u32 misc_read_reg_done;
+	u32 misc_write_reg_done;
 
 	char device_id[sizeof(u64)+1];
 	u32 fpga_design_type, fpga_design_version;
@@ -64,6 +64,8 @@ struct hab_priv {
 	bool card_registered;
 	struct work_struct card_ready_work;
 	struct snd_card *card;
+
+	struct hab_net_priv *net_priv;
 };
 
 /* DMA registers can be accessed directly through BAR 0 */
@@ -143,12 +145,12 @@ static int hab_read_misc_reg(struct hab_priv *priv, u32 reg, u64 *val)
 	hab_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_READ,
 			       REG_DMA_SCRATCH_1, reg);
 
-	priv->misc_read_done = 0;
+	priv->misc_read_reg_done = 0;
 
-	hab_assert_irq(priv, DMA_CHANNEL_MISC_READ, MISC_INTERRUPT_REQUEST);
+	hab_assert_irq(priv, DMA_CHANNEL_MISC_READ, MISC_INTERRUPT_REG_REQUEST);
 
-	ret = wait_event_interruptible_timeout(priv->misc_read_wait,
-					       READ_ONCE(priv->misc_read_done),
+	ret = wait_event_interruptible_timeout(priv->misc_read_reg_wait,
+					       READ_ONCE(priv->misc_read_reg_done),
 					       MISC_TRANSACTION_TIMEOUT);
 	if (ret == 0) {
 		mutex_unlock(&priv->misc_read_mutex);
@@ -180,12 +182,13 @@ static int hab_write_misc_reg(struct hab_priv *priv, u32 reg, u64 val)
 	hab_write_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
 			       REG_DMA_SCRATCH_3, upper_32_bits(val));
 
-	priv->misc_write_done = 0;
+	priv->misc_write_reg_done = 0;
 
-	hab_assert_irq(priv, DMA_CHANNEL_MISC_WRITE, MISC_INTERRUPT_REQUEST);
+	hab_assert_irq(priv, DMA_CHANNEL_MISC_WRITE,
+		       MISC_INTERRUPT_REG_REQUEST);
 
-	ret = wait_event_interruptible_timeout(priv->misc_write_wait,
-					       READ_ONCE(priv->misc_write_done),
+	ret = wait_event_interruptible_timeout(priv->misc_reg_write_wait,
+					       READ_ONCE(priv->misc_write_reg_done),
 					       MISC_TRANSACTION_TIMEOUT);
 
 	mutex_unlock(&priv->misc_write_mutex);
@@ -209,6 +212,56 @@ static u32 hab_read_interrupt(struct hab_priv *priv, u32 channel)
 
 	return status;
 }
+
+/*
+ * There are two channels for miscellaneous (non-audio) communication, one
+ * for reading and one for writing. Each channel has its own interrupt, and on
+ * each interrupt, the cause of the interrupt must be determined by reading
+ * the SCRATCH_0 register. Valid values are the ones defined as
+ * MISC_INTERRUPT_*.
+ *
+ * For general purpose **register reads**, the sequence is:
+ *
+ * 1. Write the register address to read into SCRATCH_1 of the read channel.
+ * 2. Latch the interrupt for the read channel with MISC_INTERRUPT_REG_REQUEST.
+ * 3. Wait for the interrupt handler with MISC_INTERRUPT_REG_REPLY.
+ * 4. Read the result from SCRATCH_2 and SCRATCH_3.
+ *
+ * For general purpose **register writes**, the sequence is:
+ * 1. Write the register address to write into SCRATCH_1 of the write channel.
+ * 2. Write the value to write into SCRATCH_2 (low 32 bits) and SCRATCH_3
+ *    (high 32 bits).
+ * 3. Latch the interrupt for the write channel with MISC_INTERRUPT_REG_REQUEST.
+ * 4. Wait for the interrupt on the write channel with MISC_INTERRUPT_REG_REPLY.
+ *
+ * For network communication, two buffers are allocated in the host memory,
+ * one for packets that flow from the host to the device (RX from the device's
+ * perspective), and one for packets that flow from the device to the host
+ * (TX from the device's perspective). The physical addresses of these
+ * buffers are written to the device using the miscellaneous registers
+ * REG_MISC_NETWORK_{TX,RX}_BUFFER_ADDR. The device will then set up EGRESS
+ * translation bridges to access these buffers directly over PCIe. Both buffers
+ * are organized as ring buffers.
+ *
+ * When the host receives a packet on its network interface that it wants to
+ * send to the device, the sequence is:
+ *
+ * 1. Copy the packet into the RX buffer
+ * 2. Update the RX buffer write position
+ * 3. Latch the write channel interrupt with MISC_INTERRUPT_NET_REQUEST
+ *
+ * The device will then read the packet from the RX buffer and process it.
+ *
+ * When the device has received a packet that it wants to send to the host,
+ * the sequence is:
+ *
+ * 1. The device copies the packet into the TX buffer
+ * 2. The device updates the TX buffer write position
+ * 3. The device latches the read channel interrupt with
+ *    MISC_INTERRUPT_NET_REQUEST
+ * 4. The host interrupt handler reads packets from the TX buffer and
+ *    processes them
+ */
 
 static irqreturn_t hab_interrupt(int irq, void *dev_id)
 {
@@ -234,12 +287,30 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 						REG_DMA_SCRATCH_0);
 		switch (cmd) {
 		case MISC_INTERRUPT_INIT_DONE:
+			/*
+			 * This interrupt may occur either as a response to the
+			 * driver sending the device a RESET command, or because
+			 * the device was not ready when the driver was loaded
+			 * and has just finished initializing itself now.
+			 *
+			 * In either case, we can now proceed with registering
+			 * the ALSA device.
+			 */
 			schedule_work(&priv->card_ready_work);
 			break;
 
-		case MISC_INTERRUPT_REPLY:
-			WRITE_ONCE(priv->misc_read_done, 1);
-			wake_up(&priv->misc_read_wait);
+		case MISC_INTERRUPT_REG_REPLY:
+			/* A register read we initiated has completed */
+			WRITE_ONCE(priv->misc_read_reg_done, 1);
+			wake_up(&priv->misc_read_reg_wait);
+			break;
+
+		case MISC_INTERRUPT_NET_REQUEST:
+			/*
+			 * The device wants us to read network packets from
+			 * the shared TX buffer
+			 */
+			hab_net_read_tx(priv->net_priv);
 			break;
 
 		default:
@@ -253,9 +324,10 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 		u32 cmd = hab_read_pcie_dma_reg(priv, DMA_CHANNEL_MISC_WRITE,
 						REG_DMA_SCRATCH_0);
 		switch (cmd) {
-		case MISC_INTERRUPT_REPLY:
-			WRITE_ONCE(priv->misc_write_done, 1);
-			wake_up(&priv->misc_write_wait);
+		case MISC_INTERRUPT_REG_REPLY:
+			/* A register write we initiated has completed */
+			WRITE_ONCE(priv->misc_write_reg_done, 1);
+			wake_up(&priv->misc_reg_write_wait);
 			break;
 
 		default:
@@ -265,6 +337,21 @@ static irqreturn_t hab_interrupt(int irq, void *dev_id)
 	}
 
 	return IRQ_HANDLED;
+}
+
+/* Network worker */
+static void hab_net_write_callback(void *arg)
+{
+	struct hab_priv *priv = arg;
+
+	/*
+	 * We have to lock the misc write mutex to ensure that no other misc
+	 * write operations are in progress, which would override the scratch0
+	 * register.
+	 */
+	mutex_lock(&priv->misc_write_mutex);
+	hab_assert_irq(priv, DMA_CHANNEL_MISC_WRITE, MISC_INTERRUPT_NET_REQUEST);
+	mutex_unlock(&priv->misc_write_mutex);
 }
 
 static const struct snd_pcm_hardware hab_playback_hw = {
@@ -604,121 +691,10 @@ static ssize_t fpga_design_version_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(fpga_design_version);
 
-static ssize_t _ip_address_show(struct device *dev, char *buf, u32 reg)
-{
-	struct hab_priv *priv = dev_get_drvdata(dev);
-	u32 ip, mask;
-	int ret;
-	u64 v;
-
-	ret = hab_read_misc_reg(priv, reg, &v);
-	if (ret < 0)
-		return ret;
-
-	if (v == 0)
-		return 0;
-
-	ip = lower_32_bits(v);
-	mask = upper_32_bits(v);
-
-	return sysfs_emit(buf, "%pI4/%pI4\n", &ip, &mask);
-}
-
-static ssize_t primary_ip_address_show(struct device *dev,
-				       struct device_attribute *attr,
-				       char *buf)
-{
-	return _ip_address_show(dev, buf, REG_MISC_PRIMARY_IP);
-}
-static DEVICE_ATTR_RO(primary_ip_address);
-
-static ssize_t secondary_ip_address_show(struct device *dev,
-					 struct device_attribute *attr,
-					 char *buf)
-{
-	return _ip_address_show(dev, buf, REG_MISC_SECONDARY_IP);
-}
-static DEVICE_ATTR_RO(secondary_ip_address);
-
-static ssize_t _mac_address_show(struct device *dev, char *buf, u32 reg)
-{
-	struct hab_priv *priv = dev_get_drvdata(dev);
-	u64 v;
-	int ret;
-
-	ret = hab_read_misc_reg(priv, reg, &v);
-	if (ret < 0)
-		return ret;
-
-	if (v == 0)
-		return 0;
-
-	return sysfs_emit(buf, "%pM\n", &v);
-}
-
-static ssize_t primary_mac_address_show(struct device *dev,
-					struct device_attribute *attr,
-					char *buf)
-{
-	return _mac_address_show(dev, buf, REG_MISC_PRIMARY_MAC);
-}
-static DEVICE_ATTR_RO(primary_mac_address);
-
-static ssize_t secondary_mac_address_show(struct device *dev,
-					  struct device_attribute *attr,
-					  char *buf)
-{
-	return _mac_address_show(dev, buf, REG_MISC_SECONDARY_MAC);
-}
-static DEVICE_ATTR_RO(secondary_mac_address);
-
-static ssize_t streams_enabled_show(struct device *dev,
-				    struct device_attribute *attr,
-				    char *buf)
-{
-	struct hab_priv *priv = dev_get_drvdata(dev);
-	u64 v;
-	int ret;
-
-	ret = hab_read_misc_reg(priv, REG_MISC_STREAMS_ENABLED, &v);
-	if (ret < 0)
-		return ret;
-
-	return sysfs_emit(buf, "%lld\n", v);
-}
-
-static ssize_t streams_enabled_store(struct device *cdev,
-				     struct device_attribute *attr,
-				     const char *buf, size_t count)
-{
-	struct hab_priv *priv = dev_get_drvdata(cdev);
-	u64 v;
-	int ret;
-
-	ret = kstrtoull(buf, 0, &v);
-	if (ret < 0)
-		return ret;
-
-	if (v != 0 && v != 1)
-		return -EINVAL;
-
-	ret = hab_write_misc_reg(priv, REG_MISC_STREAMS_ENABLED, v);
-	if (ret < 0)
-		return ret;
-
-	return count;
-}
-static DEVICE_ATTR_RW(streams_enabled);
-
 static struct attribute *hab_dev_attrs[] = {
 	&dev_attr_device_id.attr,
 	&dev_attr_fpga_design_type.attr,
 	&dev_attr_fpga_design_version.attr,
-	&dev_attr_primary_ip_address.attr,
-	&dev_attr_secondary_ip_address.attr,
-	&dev_attr_primary_mac_address.attr,
-	&dev_attr_secondary_mac_address.attr,
-	&dev_attr_streams_enabled.attr,
 	NULL,
 };
 
@@ -750,7 +726,8 @@ static void hab_card_ready(struct work_struct *work)
 	int ret, i;
 	u64 v;
 
-	ret = hab_write_misc_reg(priv, REG_MISC_PCM_CONTROL_BASE, priv->bar2_phys);
+	ret = hab_write_misc_reg(priv, REG_MISC_PCM_CONTROL_BASE,
+				 priv->bar2_phys);
 	if (ret < 0) {
 		dev_err(dev, "error writing PCM control base: %d\n", ret);
 		return;
@@ -776,6 +753,20 @@ static void hab_card_ready(struct work_struct *work)
 
 		if (priv->device_id[i] == 0 || priv->device_id[i] == 0xff)
 			break;
+	}
+
+	v = (u64) hab_net_rx_buffer_phys(priv->net_priv);
+	ret = hab_write_misc_reg(priv, REG_MISC_NETWORK_RX_BUFFER_ADDR, v);
+	if (ret < 0) {
+		dev_err(dev, "error writing network RX buffer addr: %d\n", ret);
+		return;
+	}
+
+	v = (u64) hab_net_tx_buffer_phys(priv->net_priv);
+	ret = hab_write_misc_reg(priv, REG_MISC_NETWORK_TX_BUFFER_ADDR, v);
+	if (ret < 0) {
+		dev_err(dev, "error writing network TX buffer addr: %d\n", ret);
+		return;
 	}
 
 	scnprintf(priv->card->longname, sizeof(priv->card->longname),
@@ -821,8 +812,8 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 	spin_lock_init(&priv->lock);
 	mutex_init(&priv->misc_read_mutex);
 	mutex_init(&priv->misc_write_mutex);
-	init_waitqueue_head(&priv->misc_read_wait);
-	init_waitqueue_head(&priv->misc_write_wait);
+	init_waitqueue_head(&priv->misc_read_reg_wait);
+	init_waitqueue_head(&priv->misc_reg_write_wait);
 
 	pci_set_drvdata(pci, priv);
 
@@ -885,6 +876,15 @@ static int __hab_probe(struct pci_dev *pci, const struct pci_device_id *pci_id)
 
 	hwdep->iface = SNDRV_HWDEP_IFACE_HOLOPLOT;
 	hwdep->private_data = priv;
+
+	/* Network interface */
+	ret = hab_net_net_probe(dev, &priv->net_priv);
+	if (ret < 0) {
+		dev_err(dev, "error initializing network interface: %d\n", ret);
+		return ret;
+	}
+
+	hab_net_set_write_callback(priv->net_priv, hab_net_write_callback, priv);
 
 	/* Sysfs attributes, exposed through hwdep */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
