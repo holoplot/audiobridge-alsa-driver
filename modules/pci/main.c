@@ -107,16 +107,23 @@ static int hab_write_audio_dma_run(struct hab_priv *priv, u64 offset, bool run)
 	writeq(val, reg);
 
 	if (!run) {
-		u64 r;
+		u64 r, max_ms;
 
 		/*
-		 * The RUN bit will be cleared by the hardware only after the
-		 * current DMA period has been processed.
-		 * Wait for that to happen.
+		 * Calculate the maximum time for one period to finish, in milliseconds,
+		 * assuming 48 KHz and 4 bytes per sample.
 		 */
+		max_ms = hab_read_audio_dma_reg(priv, offset + REG_PCM_PERIOD_SIZE);
+		max_ms = DIV_ROUND_UP(max_ms, CHANNELS_MAX * 48 * 4);
+
+		/*
+		* The RUN bit will be cleared by the hardware only after the
+		* current DMA period has been processed.
+		* Wait for that to happen.
+		*/
 		return read_poll_timeout_atomic(readq, r,
 						(r & REG_PCM_CONTROL_RUN) == 0,
-						10, 1000, false, reg);
+						1000, max_ms * 1000, false, reg);
 	}
 
 	return 0;
